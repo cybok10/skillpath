@@ -1,0 +1,8 @@
+{
+  "name": "SkillPath AI",
+  "description": "AI-Powered Personalized Skill, Career & Mentorship Growth Platform featuring personalized roadmaps, AI mentorship, and verified human guidance.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
