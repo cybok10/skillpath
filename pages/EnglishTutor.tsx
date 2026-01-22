@@ -1,7 +1,7 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { Layout } from '../components/Layout';
-import { Mic, MicOff, Globe, ArrowLeft, RefreshCw, StopCircle, Video, VideoOff } from 'lucide-react';
+import { Mic, MicOff, Globe, ArrowLeft, RefreshCw, StopCircle, Video, VideoOff, Keyboard, Send, X } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { interactWithEnglishTutor } from '../services/geminiService';
 import { ChatMessage } from '../types';
@@ -24,18 +24,32 @@ export const EnglishTutor: React.FC = () => {
     const [cameraEnabled, setCameraEnabled] = useState(true);
     const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
     
+    // Text Mode State
+    const [isKeyboardMode, setIsKeyboardMode] = useState(false);
+    const [inputText, setInputText] = useState('');
+    
     // Refs to track state inside event listeners and async callbacks
     const recognitionRef = useRef<any>(null);
     const videoRef = useRef<HTMLVideoElement>(null);
     const messagesRef = useRef<ChatMessage[]>([]);
+    const nativeLanguageRef = useRef(nativeLanguage);
+    const voicesRef = useRef<SpeechSynthesisVoice[]>([]);
     const isListeningRef = useRef(false); // Valid source of truth for recognition status
     
     const synth = window.speechSynthesis;
 
-    // Sync messages state to ref for access in callbacks
+    // Sync state to refs
     useEffect(() => {
         messagesRef.current = messages;
     }, [messages]);
+
+    useEffect(() => {
+        nativeLanguageRef.current = nativeLanguage;
+    }, [nativeLanguage]);
+
+    useEffect(() => {
+        voicesRef.current = voices;
+    }, [voices]);
 
     // 1. Initialize Camera
     useEffect(() => {
@@ -113,12 +127,13 @@ export const EnglishTutor: React.FC = () => {
                 if (event.error === 'not-allowed') {
                     setError("Microphone access denied. Please allow permissions.");
                 } else if (event.error === 'no-speech') {
-                    // Ignore no-speech errors, just reset state
-                    setError(''); 
+                    // Ignore no-speech errors
                 } else if (event.error === 'network') {
-                    setError("Network error. Please check your internet connection.");
+                    setError("Network error detected. Try switching to Keyboard Mode.");
                 } else {
-                    setError("Could not hear you. Please try again.");
+                    if (event.error !== 'aborted') {
+                        setError(`Error: ${event.error}`);
+                    }
                 }
             };
 
@@ -130,6 +145,7 @@ export const EnglishTutor: React.FC = () => {
             recognitionRef.current = recognition;
         } else {
             setError("Your browser does not support speech recognition.");
+            setIsKeyboardMode(true);
         }
 
         // Initial Greeting
@@ -141,7 +157,6 @@ export const EnglishTutor: React.FC = () => {
 
         return () => {
             if (recognitionRef.current) {
-                // Try to abort cleanly
                 try { recognitionRef.current.abort(); } catch(e) {}
             }
             synth.cancel();
@@ -159,11 +174,12 @@ export const EnglishTutor: React.FC = () => {
         utterance.rate = 1.0; 
         utterance.pitch = 1.05; 
         
+        const currentVoices = voicesRef.current;
         const preferredVoice = 
-            voices.find(v => v.name.includes('Google US English')) || 
-            voices.find(v => v.name.includes('Zira')) || 
-            voices.find(v => v.lang.startsWith('en')) ||
-            voices[0];
+            currentVoices.find(v => v.name.includes('Google US English')) || 
+            currentVoices.find(v => v.name.includes('Zira')) || 
+            currentVoices.find(v => v.lang.startsWith('en')) ||
+            currentVoices[0];
 
         if (preferredVoice) {
             utterance.voice = preferredVoice;
@@ -184,14 +200,13 @@ export const EnglishTutor: React.FC = () => {
         } else {
             setError('');
             setTranscript('');
-            synth.cancel(); // Stop speaking if interrupt
+            synth.cancel(); 
             setIsSpeaking(false);
             
             try {
                 recognitionRef.current.start();
             } catch (e: any) {
                 console.error("Start error:", e);
-                // Handle 'already started' error gracefully
                 if (e.message && e.message.includes('already started')) {
                     setIsListening(true);
                     isListeningRef.current = true;
@@ -214,8 +229,8 @@ export const EnglishTutor: React.FC = () => {
         const updatedMessages = [...messagesRef.current, userMsg];
         setMessages(updatedMessages);
 
-        // Get AI Response
-        const response = await interactWithEnglishTutor(updatedMessages, text, nativeLanguage);
+        // Get AI Response using Ref for nativeLanguage
+        const response = await interactWithEnglishTutor(updatedMessages, text, nativeLanguageRef.current);
         
         const aiMsg: ChatMessage = {
             id: (Date.now() + 1).toString(),
@@ -226,6 +241,15 @@ export const EnglishTutor: React.FC = () => {
 
         setMessages(prev => [...prev, aiMsg]);
         speak(response);
+    };
+
+    const handleTextSubmit = (e: React.FormEvent) => {
+        e.preventDefault();
+        if (!inputText.trim()) return;
+        
+        setTranscript(inputText);
+        handleUserMessage(inputText);
+        setInputText('');
     };
 
     return (
@@ -300,14 +324,28 @@ export const EnglishTutor: React.FC = () => {
                                 </p>
                             ) : isSpeaking ? (
                                 <p className="text-xl font-bold text-blue-600">AI is speaking...</p>
+                            ) : isKeyboardMode ? (
+                                <p className="text-gray-500 font-medium">Type your message below</p>
                             ) : (
                                 <p className="text-gray-500 font-medium">Tap the mic to start speaking</p>
                             )}
-                            {error && <p className="text-red-500 text-sm mt-1 font-medium bg-red-50 px-3 py-1 rounded-full inline-block border border-red-100">{error}</p>}
+                            
+                            {/* Dismissible Error Toast */}
+                            {error && (
+                                <div className="mt-2 inline-flex items-center gap-2 bg-red-50 border border-red-100 px-4 py-2 rounded-full animate-fade-in-up">
+                                    <p className="text-red-600 text-sm font-medium">{error}</p>
+                                    <button 
+                                        onClick={() => setError('')} 
+                                        className="text-red-400 hover:text-red-600"
+                                    >
+                                        <X size={14} />
+                                    </button>
+                                </div>
+                            )}
                         </div>
 
                         {/* Last User Message (Subtitles) */}
-                        {transcript && (
+                        {transcript && !isKeyboardMode && (
                             <div className="mt-4 px-6 py-3 bg-white/80 backdrop-blur rounded-2xl border border-white/50 shadow-sm max-w-lg text-center">
                                 <p className="text-gray-700 font-medium">"{transcript}"</p>
                             </div>
@@ -346,36 +384,73 @@ export const EnglishTutor: React.FC = () => {
                     </div>
 
                     {/* Controls Bar */}
-                    <div className="h-24 bg-white border-t border-gray-100 flex items-center justify-center gap-8 relative z-40 shadow-[0_-4px_20px_rgba(0,0,0,0.05)]">
+                    <div className="h-24 bg-white border-t border-gray-100 flex items-center justify-center gap-6 relative z-40 shadow-[0_-4px_20px_rgba(0,0,0,0.05)] px-6">
+                         {/* Left: Stop Speaking */}
                          <button 
                             onClick={() => synth.cancel()} 
-                            className="p-4 rounded-full text-gray-400 hover:bg-red-50 hover:text-red-500 transition-colors"
+                            className="p-3 md:p-4 rounded-full text-gray-400 hover:bg-red-50 hover:text-red-500 transition-colors"
                             title="Stop Speaking"
                         >
                             <StopCircle size={24} />
                          </button>
 
-                         <button 
-                            onClick={toggleListening}
-                            className={`w-16 h-16 rounded-full flex items-center justify-center shadow-lg transition-all transform active:scale-95 border-4 border-white ${
-                                isListening 
-                                ? 'bg-red-500 text-white shadow-red-200 scale-110 ring-4 ring-red-100' 
-                                : 'bg-brand-600 text-white shadow-brand-200 hover:bg-brand-700'
-                            }`}
-                        >
-                            {isListening ? <MicOff size={28} /> : <Mic size={28} />}
-                        </button>
+                         {/* Center: Interaction Mode */}
+                         {isKeyboardMode ? (
+                            <form onSubmit={handleTextSubmit} className="flex-1 max-w-lg flex gap-2">
+                                <input
+                                    type="text"
+                                    value={inputText}
+                                    onChange={(e) => setInputText(e.target.value)}
+                                    placeholder="Type your response..."
+                                    className="flex-1 bg-gray-100 border-none rounded-xl px-4 focus:ring-2 focus:ring-brand-500 focus:outline-none"
+                                    autoFocus
+                                />
+                                <button 
+                                    type="submit"
+                                    disabled={!inputText.trim()}
+                                    className="bg-brand-600 text-white p-3 rounded-xl hover:bg-brand-700 disabled:opacity-50 transition-colors"
+                                >
+                                    <Send size={20} />
+                                </button>
+                            </form>
+                         ) : (
+                             <button 
+                                onClick={toggleListening}
+                                className={`w-16 h-16 rounded-full flex items-center justify-center shadow-lg transition-all transform active:scale-95 border-4 border-white ${
+                                    isListening 
+                                    ? 'bg-red-500 text-white shadow-red-200 scale-110 ring-4 ring-red-100' 
+                                    : 'bg-brand-600 text-white shadow-brand-200 hover:bg-brand-700'
+                                }`}
+                            >
+                                {isListening ? <MicOff size={28} /> : <Mic size={28} />}
+                            </button>
+                         )}
 
-                         <button 
-                             onClick={() => {
-                                 const lastAiMsg = [...messages].reverse().find(m => m.role === 'model');
-                                 if (lastAiMsg) speak(lastAiMsg.text);
-                             }}
-                             className="p-4 rounded-full text-gray-400 hover:bg-blue-50 hover:text-blue-500 transition-colors"
-                             title="Replay Last Message"
-                         >
-                            <RefreshCw size={24} />
-                         </button>
+                         {/* Right: Toggle Mode & Replay */}
+                         <div className="flex gap-2">
+                            <button 
+                                onClick={() => {
+                                    const lastAiMsg = [...messages].reverse().find(m => m.role === 'model');
+                                    if (lastAiMsg) speak(lastAiMsg.text);
+                                }}
+                                className="p-3 md:p-4 rounded-full text-gray-400 hover:bg-blue-50 hover:text-blue-500 transition-colors"
+                                title="Replay Last Message"
+                            >
+                                <RefreshCw size={24} />
+                            </button>
+                            
+                            <button 
+                                onClick={() => {
+                                    setIsKeyboardMode(!isKeyboardMode);
+                                    if(isListening) toggleListening(); // Stop mic if switching
+                                    setError('');
+                                }}
+                                className={`p-3 md:p-4 rounded-full transition-colors ${isKeyboardMode ? 'bg-brand-50 text-brand-600' : 'text-gray-400 hover:bg-gray-100'}`}
+                                title={isKeyboardMode ? "Switch to Voice Mode" : "Switch to Keyboard Mode"}
+                            >
+                                {isKeyboardMode ? <Mic size={24} /> : <Keyboard size={24} />}
+                            </button>
+                         </div>
                     </div>
                 </div>
             </div>

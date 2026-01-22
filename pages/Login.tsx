@@ -1,14 +1,11 @@
 
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
-import { Mail, Lock, ArrowRight, AlertCircle, Loader2, X } from 'lucide-react';
+import { Mail, Lock, ArrowRight, AlertCircle, Loader2, Github, Linkedin } from 'lucide-react';
 import { authService } from '../services/authService';
 
-declare global {
-  interface Window {
-    google?: any;
-  }
-}
+// Backend URL for Social Login Redirects
+const API_BASE_URL = 'http://localhost:8000';
 
 export const Login: React.FC = () => {
   const navigate = useNavigate();
@@ -17,67 +14,6 @@ export const Login: React.FC = () => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
-  // Google Auth State
-  const [showGoogleModal, setShowGoogleModal] = useState(false);
-  const [googleLoading, setGoogleLoading] = useState(false);
-  const [googleEmail, setGoogleEmail] = useState('');
-
-  // 1. Initialize Real Google Auth (If Client ID is provided)
-  // Replace 'YOUR_GOOGLE_CLIENT_ID' with your actual Google Cloud Console Client ID.
-  const GOOGLE_CLIENT_ID = process.env.REACT_APP_GOOGLE_CLIENT_ID || 'YOUR_CLIENT_ID_HERE'; 
-  const hasRealGoogleClient = GOOGLE_CLIENT_ID && GOOGLE_CLIENT_ID !== 'YOUR_CLIENT_ID_HERE';
-
-  const parseJwt = (token: string) => {
-    try {
-      return JSON.parse(atob(token.split('.')[1]));
-    } catch (e) {
-      return null;
-    }
-  };
-
-  const handleRealGoogleCallback = async (response: any) => {
-    try {
-        const credential = response.credential;
-        const payload = parseJwt(credential);
-        
-        if (payload) {
-            setLoading(true);
-            const { email, name, picture } = payload;
-            
-            // Call auth service
-            const success = await authService.googleLogin(email, name, picture);
-            
-            if (success) {
-                navigate('/dashboard');
-            } else {
-                setError("Google login failed.");
-                setLoading(false);
-            }
-        }
-    } catch (err) {
-        console.error("Google Auth Error", err);
-        setError("Authentication failed");
-        setLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    if (window.google && hasRealGoogleClient) {
-      window.google.accounts.id.initialize({
-        client_id: GOOGLE_CLIENT_ID,
-        callback: handleRealGoogleCallback
-      });
-      
-      const btnDiv = document.getElementById("google-signin-btn");
-      if (btnDiv) {
-        window.google.accounts.id.renderButton(
-          btnDiv,
-          { theme: "outline", size: "large", width: 400, text: "sign_in_with", shape: "rectangular" }
-        );
-      }
-    }
-  }, [hasRealGoogleClient]);
-
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoading(true);
@@ -85,6 +21,7 @@ export const Login: React.FC = () => {
     
     try {
       await authService.login(email, password);
+      // Wait a bit for token to settle
       setTimeout(() => {
         setLoading(false);
         navigate('/dashboard');
@@ -95,107 +32,8 @@ export const Login: React.FC = () => {
     }
   };
 
-  // 2. Trigger Logic for Mock
-  const initiateGoogleLogin = () => {
-    if (hasRealGoogleClient) {
-        // If the button didn't render or user clicked a custom trigger (fallback)
-        // Usually renderButton handles the click. 
-        // We can use prompt() for One Tap or automatic sign-in
-        window.google.accounts.id.prompt();
-    } else {
-        // Fallback: Open Simulated Google Modal to verify email
-        setShowGoogleModal(true);
-    }
-  };
-
-  // 3. Handle Simulated/Manual Google Login
-  const confirmGoogleLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!googleEmail) return;
-
-    setGoogleLoading(true);
-    
-    // Simulate network delay for verification
-    setTimeout(async () => {
-        try {
-            // Generate deterministic mock data based on input
-            const namePart = googleEmail.split('@')[0];
-            const mockName = namePart.charAt(0).toUpperCase() + namePart.slice(1);
-            const mockPhoto = `https://ui-avatars.com/api/?name=${mockName}&background=random`;
-
-            // Call Backend
-            await authService.googleLogin(googleEmail, mockName, mockPhoto);
-            
-            setGoogleLoading(false);
-            setShowGoogleModal(false);
-            navigate('/onboarding');
-        } catch (err) {
-            setGoogleLoading(false);
-            setError("Failed to authenticate with Google.");
-        }
-    }, 1500);
-  };
-
   return (
     <div className="min-h-screen bg-white flex relative">
-      {/* Google Simulation Modal */}
-      {showGoogleModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 animate-in fade-in">
-            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden transform scale-100 transition-all">
-                <div className="p-6 border-b border-gray-100 flex justify-between items-center bg-gray-50">
-                    <div className="flex items-center gap-3">
-                         <img src="https://www.svgrepo.com/show/475656/google-color.svg" alt="Google" className="w-6 h-6" />
-                         <span className="font-bold text-gray-700">Sign in with Google</span>
-                    </div>
-                    <button onClick={() => setShowGoogleModal(false)} className="text-gray-400 hover:text-gray-600">
-                        <X size={24} />
-                    </button>
-                </div>
-                
-                <div className="p-8">
-                    <p className="text-gray-600 mb-6 text-sm">
-                        To continue to <strong>SkillPath AI</strong>, please verify your Google account email.
-                    </p>
-                    
-                    <form onSubmit={confirmGoogleLogin}>
-                        <div className="mb-6">
-                            <label className="block text-xs font-bold text-gray-500 uppercase tracking-wide mb-2">Google Email</label>
-                            <input 
-                                type="email" 
-                                required
-                                value={googleEmail}
-                                onChange={(e) => setGoogleEmail(e.target.value)}
-                                className="w-full px-4 py-3 rounded-xl border border-gray-300 focus:border-blue-500 focus:ring-2 focus:ring-blue-100 outline-none transition-all"
-                                placeholder="name@gmail.com"
-                                autoFocus
-                            />
-                        </div>
-
-                        <div className="flex flex-col gap-3">
-                            <button 
-                                type="submit" 
-                                disabled={googleLoading}
-                                className="w-full bg-blue-600 text-white py-3 rounded-xl font-bold hover:bg-blue-700 transition-colors flex items-center justify-center gap-2"
-                            >
-                                {googleLoading ? <Loader2 className="animate-spin" size={20} /> : "Continue"}
-                            </button>
-                            <button 
-                                type="button"
-                                onClick={() => setShowGoogleModal(false)}
-                                className="w-full bg-white text-gray-600 py-3 rounded-xl font-medium border border-gray-200 hover:bg-gray-50 transition-colors"
-                            >
-                                Cancel
-                            </button>
-                        </div>
-                    </form>
-                </div>
-                <div className="bg-gray-50 p-4 text-center text-xs text-gray-400">
-                    Secure Login Simulation
-                </div>
-            </div>
-        </div>
-      )}
-
       {/* Left Side - Visual Branding */}
       <div className="hidden lg:flex w-1/2 bg-brand-50 relative items-center justify-center p-12 overflow-hidden">
         <div className="absolute top-0 left-0 w-full h-full bg-[url('https://www.transparenttextures.com/patterns/cubes.png')] opacity-20"></div>
@@ -228,20 +66,31 @@ export const Login: React.FC = () => {
                 </div>
             )}
 
-            {/* Google Login Button Container */}
-            <div className="mb-6">
-                {hasRealGoogleClient ? (
-                    <div id="google-signin-btn" className="w-full h-[50px] flex justify-center"></div>
-                ) : (
-                    <button 
-                        onClick={initiateGoogleLogin}
-                        disabled={loading}
-                        className="w-full flex items-center justify-center gap-3 bg-white border border-gray-200 p-4 rounded-xl text-gray-700 font-medium hover:bg-gray-50 hover:border-gray-300 transition-all group active:scale-95 disabled:opacity-70 disabled:cursor-not-allowed"
-                    >
-                        <img src="https://www.svgrepo.com/show/475656/google-color.svg" alt="Google" className="w-6 h-6" />
-                        <span>Sign in with Google</span>
-                    </button>
-                )}
+            {/* Social Login Buttons */}
+            <div className="grid grid-cols-3 gap-3 mb-6">
+                <a 
+                    href={`${API_BASE_URL}/auth/signin/google`}
+                    className="flex items-center justify-center py-3 px-4 border border-gray-200 rounded-xl hover:bg-gray-50 hover:border-gray-300 transition-all group"
+                    title="Sign in with Google"
+                >
+                    <img src="https://www.svgrepo.com/show/475656/google-color.svg" alt="Google" className="w-6 h-6 group-hover:scale-110 transition-transform" />
+                </a>
+                
+                <a 
+                    href={`${API_BASE_URL}/auth/signin/github`}
+                    className="flex items-center justify-center py-3 px-4 border border-gray-200 rounded-xl hover:bg-gray-900 hover:text-white hover:border-gray-900 transition-all text-gray-700 group"
+                    title="Sign in with GitHub"
+                >
+                    <Github size={24} className="group-hover:scale-110 transition-transform" />
+                </a>
+
+                <a 
+                    href={`${API_BASE_URL}/auth/signin/linkedin`}
+                    className="flex items-center justify-center py-3 px-4 border border-gray-200 rounded-xl hover:bg-[#0077b5] hover:text-white hover:border-[#0077b5] transition-all text-[#0077b5] group"
+                    title="Sign in with LinkedIn"
+                >
+                    <Linkedin size={24} className="group-hover:scale-110 transition-transform" />
+                </a>
             </div>
 
             <div className="relative mb-8">

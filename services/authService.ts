@@ -54,8 +54,24 @@ export const authService = {
   },
 
   logout: () => {
+    // Clear Token
     localStorage.removeItem('auth_token');
+    
+    // Clear Profile Data to prevent multi-user collision
     localStorage.removeItem('user_profile');
+    localStorage.removeItem('cached_full_profile');
+    
+    // Clear Generated Content
+    localStorage.removeItem('skillpath_roadmap');
+    
+    // Clear Local Stats (now handled by Backend)
+    localStorage.removeItem('user_streak');
+    localStorage.removeItem('last_login_date');
+    
+    // Clear Session specific data
+    localStorage.removeItem('onboarding_data');
+    localStorage.removeItem('onboarding_step');
+    sessionStorage.clear();
   },
 
   updateProfile: async (profile: Partial<StudentProfile>) => {

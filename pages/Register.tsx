@@ -1,3 +1,4 @@
+
 import React, { useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import { Mail, Lock, User, ArrowRight, AlertCircle } from 'lucide-react';
@@ -19,10 +20,10 @@ export const Register: React.FC = () => {
     try {
       const success = await authService.register(name, email, password);
       if (success) {
-        // Redirect to onboarding on success
+        // Redirect to dashboard on success, skipping onboarding questions
         setTimeout(() => {
             setLoading(false);
-            navigate('/onboarding');
+            navigate('/dashboard');
         }, 800);
       } else {
          throw new Error("Registration failed");
