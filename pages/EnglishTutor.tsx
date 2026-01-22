@@ -1,457 +1,424 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { Layout } from '../components/Layout';
-import { Mic, MicOff, Globe, ArrowLeft, RefreshCw, StopCircle, Video, VideoOff, Keyboard, Send, X } from 'lucide-react';
+import { Mic, MicOff, Globe, ArrowLeft, Video, VideoOff, Power, Activity } from 'lucide-react';
 import { Link } from 'react-router-dom';
-import { interactWithEnglishTutor } from '../services/geminiService';
-import { ChatMessage } from '../types';
+import { getGeminiClient } from '../services/geminiService';
+import { LiveServerMessage, Modality } from '@google/genai';
 
-// Web Speech API Types
-declare global {
-  interface Window {
-    SpeechRecognition: any;
-    webkitSpeechRecognition: any;
+// --- Helper Functions for Audio/Video Encoding & Decoding ---
+function createBlob(data: Float32Array) {
+  const l = data.length;
+  const int16 = new Int16Array(l);
+  for (let i = 0; i < l; i++) {
+    int16[i] = data[i] * 32768;
   }
+  const uint8 = new Uint8Array(int16.buffer);
+  let binary = '';
+  const len = uint8.byteLength;
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(uint8[i]);
+  }
+  const base64Data = btoa(binary);
+  
+  return {
+    data: base64Data,
+    mimeType: 'audio/pcm;rate=16000',
+  };
+}
+
+function decode(base64: string) {
+  const binaryString = atob(base64);
+  const len = binaryString.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
+async function decodeAudioData(
+  data: Uint8Array,
+  ctx: AudioContext,
+  sampleRate: number,
+  numChannels: number,
+): Promise<AudioBuffer> {
+  const dataInt16 = new Int16Array(data.buffer);
+  const frameCount = dataInt16.length / numChannels;
+  const buffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
+
+  for (let channel = 0; channel < numChannels; channel++) {
+    const channelData = buffer.getChannelData(channel);
+    for (let i = 0; i < frameCount; i++) {
+      channelData[i] = dataInt16[i * numChannels + channel] / 32768.0;
+    }
+  }
+  return buffer;
+}
+
+async function blobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const base64Data = (reader.result as string).split(',')[1];
+      resolve(base64Data);
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
 }
 
 export const EnglishTutor: React.FC = () => {
-    const [isListening, setIsListening] = useState(false);
-    const [isSpeaking, setIsSpeaking] = useState(false);
-    const [transcript, setTranscript] = useState('');
-    const [messages, setMessages] = useState<ChatMessage[]>([]);
+    const [isConnected, setIsConnected] = useState(false);
     const [nativeLanguage, setNativeLanguage] = useState('Spanish');
-    const [error, setError] = useState('');
     const [cameraEnabled, setCameraEnabled] = useState(true);
-    const [voices, setVoices] = useState<SpeechSynthesisVoice[]>([]);
-    
-    // Text Mode State
-    const [isKeyboardMode, setIsKeyboardMode] = useState(false);
-    const [inputText, setInputText] = useState('');
-    
-    // Refs to track state inside event listeners and async callbacks
-    const recognitionRef = useRef<any>(null);
+    const [error, setError] = useState('');
+    const [audioLevel, setAudioLevel] = useState(0);
+
+    // Refs for Media & Processing
     const videoRef = useRef<HTMLVideoElement>(null);
-    const messagesRef = useRef<ChatMessage[]>([]);
-    const nativeLanguageRef = useRef(nativeLanguage);
-    const voicesRef = useRef<SpeechSynthesisVoice[]>([]);
-    const isListeningRef = useRef(false); // Valid source of truth for recognition status
-    
-    const synth = window.speechSynthesis;
+    const canvasRef = useRef<HTMLCanvasElement>(document.createElement('canvas'));
+    const audioContextRef = useRef<AudioContext | null>(null);
+    const inputSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+    const processorRef = useRef<ScriptProcessorNode | null>(null);
+    const videoIntervalRef = useRef<number | null>(null);
+    const nextStartTimeRef = useRef<number>(0);
+    const sessionPromiseRef = useRef<Promise<any> | null>(null);
+    const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
 
-    // Sync state to refs
+    // Clean up on unmount
     useEffect(() => {
-        messagesRef.current = messages;
-    }, [messages]);
-
-    useEffect(() => {
-        nativeLanguageRef.current = nativeLanguage;
-    }, [nativeLanguage]);
-
-    useEffect(() => {
-        voicesRef.current = voices;
-    }, [voices]);
-
-    // 1. Initialize Camera
-    useEffect(() => {
-        let stream: MediaStream | null = null;
-
-        const startCamera = async () => {
-            try {
-                if (cameraEnabled) {
-                    stream = await navigator.mediaDevices.getUserMedia({ video: true });
-                    if (videoRef.current) {
-                        videoRef.current.srcObject = stream;
-                    }
-                } else {
-                    if (videoRef.current && videoRef.current.srcObject) {
-                        const tracks = (videoRef.current.srcObject as MediaStream).getTracks();
-                        tracks.forEach(t => t.stop());
-                        videoRef.current.srcObject = null;
-                    }
-                }
-            } catch (err) {
-                console.error("Camera error:", err);
-                setError("Camera access denied or unavailable.");
-            }
-        };
-
-        startCamera();
-
         return () => {
-            if (stream) {
-                stream.getTracks().forEach(track => track.stop());
-            }
+            disconnect();
         };
-    }, [cameraEnabled]);
+    }, []);
 
-    // 2. Load Voices for TTS
-    useEffect(() => {
-        const loadVoices = () => {
-            const availableVoices = synth.getVoices();
-            setVoices(availableVoices);
-        };
-        
-        loadVoices();
-        if (synth.onvoiceschanged !== undefined) {
-            synth.onvoiceschanged = loadVoices;
-        }
-    }, [synth]);
-
-    // 3. Initialize Speech Recognition
-    useEffect(() => {
-        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-        if (SpeechRecognition) {
-            const recognition = new SpeechRecognition();
-            recognition.continuous = false; 
-            recognition.lang = 'en-US';
-            recognition.interimResults = false;
-            recognition.maxAlternatives = 1;
-
-            recognition.onstart = () => {
-                setIsListening(true);
-                isListeningRef.current = true;
-                setError('');
-            };
-
-            recognition.onresult = (event: any) => {
-                const text = event.results[0][0].transcript;
-                setTranscript(text);
-                handleUserMessage(text);
-            };
-
-            recognition.onerror = (event: any) => {
-                console.error("Speech error", event.error);
-                setIsListening(false);
-                isListeningRef.current = false;
-
-                if (event.error === 'not-allowed') {
-                    setError("Microphone access denied. Please allow permissions.");
-                } else if (event.error === 'no-speech') {
-                    // Ignore no-speech errors
-                } else if (event.error === 'network') {
-                    setError("Network error detected. Try switching to Keyboard Mode.");
-                } else {
-                    if (event.error !== 'aborted') {
-                        setError(`Error: ${event.error}`);
-                    }
-                }
-            };
-
-            recognition.onend = () => {
-                setIsListening(false);
-                isListeningRef.current = false;
-            };
-
-            recognitionRef.current = recognition;
-        } else {
-            setError("Your browser does not support speech recognition.");
-            setIsKeyboardMode(true);
-        }
-
-        // Initial Greeting
-        const greeting = "Hi there! I'm your English tutor. What topic shall we practice today?";
-        setMessages([{ id: 'init', role: 'model', text: greeting, timestamp: new Date() }]);
-        
-        // Slight delay to allow voices to load
-        setTimeout(() => speak(greeting), 1000);
-
-        return () => {
-            if (recognitionRef.current) {
-                try { recognitionRef.current.abort(); } catch(e) {}
-            }
-            synth.cancel();
-        };
-    }, []); 
-
-    const speak = (text: string) => {
-        if (synth.speaking) synth.cancel();
-        
-        // Remove emojis or markdown for cleaner speech
-        const cleanText = text.replace(/[*#]/g, '');
-
-        const utterance = new SpeechSynthesisUtterance(cleanText);
-        utterance.lang = 'en-US';
-        utterance.rate = 1.0; 
-        utterance.pitch = 1.05; 
-        
-        const currentVoices = voicesRef.current;
-        const preferredVoice = 
-            currentVoices.find(v => v.name.includes('Google US English')) || 
-            currentVoices.find(v => v.name.includes('Zira')) || 
-            currentVoices.find(v => v.lang.startsWith('en')) ||
-            currentVoices[0];
-
-        if (preferredVoice) {
-            utterance.voice = preferredVoice;
-        }
-
-        utterance.onstart = () => setIsSpeaking(true);
-        utterance.onend = () => setIsSpeaking(false);
-        utterance.onerror = () => setIsSpeaking(false);
-
-        synth.speak(utterance);
-    };
-
-    const toggleListening = () => {
-        if (!recognitionRef.current) return;
-
-        if (isListeningRef.current) {
-            recognitionRef.current.stop();
-        } else {
+    const connect = async () => {
+        try {
             setError('');
-            setTranscript('');
-            synth.cancel(); 
-            setIsSpeaking(false);
+            const ai = getGeminiClient();
             
-            try {
-                recognitionRef.current.start();
-            } catch (e: any) {
-                console.error("Start error:", e);
-                if (e.message && e.message.includes('already started')) {
-                    setIsListening(true);
-                    isListeningRef.current = true;
-                }
+            // 1. Initialize Audio Contexts
+            const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
+            if (!AudioContext) {
+                setError("Your browser does not support Audio Context.");
+                return;
             }
+            const inputCtx = new AudioContext({ sampleRate: 16000 });
+            const outputCtx = new AudioContext({ sampleRate: 24000 });
+            audioContextRef.current = outputCtx;
+
+            // 2. Establish Live Session
+            const sessionPromise = ai.live.connect({
+                model: 'gemini-2.5-flash-native-audio-preview-12-2025',
+                config: {
+                    responseModalities: [Modality.AUDIO],
+                    speechConfig: {
+                        voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } }, 
+                    },
+                    systemInstruction: `You are a friendly, patient, and professional English Tutor. 
+                    The student's native language is ${nativeLanguage}. 
+                    Correct their grammar gently. 
+                    If you see video input, comment on what you see to make the conversation engaging.
+                    Keep responses concise and conversational.`,
+                },
+                callbacks: {
+                    onopen: async () => {
+                        console.log("Session Opened");
+                        setIsConnected(true);
+                        
+                        // Setup Audio Input Stream
+                        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                        const source = inputCtx.createMediaStreamSource(stream);
+                        const processor = inputCtx.createScriptProcessor(4096, 1, 1);
+                        
+                        processor.onaudioprocess = (e) => {
+                            const inputData = e.inputBuffer.getChannelData(0);
+                            const pcmBlob = createBlob(inputData);
+                            
+                            // Visualizer math
+                            let sum = 0;
+                            for (let i = 0; i < inputData.length; i++) sum += inputData[i] * inputData[i];
+                            setAudioLevel(Math.sqrt(sum / inputData.length) * 100);
+
+                            sessionPromise.then(session => {
+                                session.sendRealtimeInput({ media: pcmBlob });
+                            });
+                        };
+
+                        source.connect(processor);
+                        processor.connect(inputCtx.destination);
+                        
+                        inputSourceRef.current = source;
+                        processorRef.current = processor;
+
+                        // Setup Video Input Loop
+                        if (cameraEnabled) {
+                           startVideoLoop(sessionPromise);
+                        }
+                    },
+                    onmessage: async (msg: LiveServerMessage) => {
+                        const base64Audio = msg.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+                        if (base64Audio) {
+                            // Decode and Schedule Audio
+                            const outputCtx = audioContextRef.current;
+                            if (!outputCtx) return;
+
+                            nextStartTimeRef.current = Math.max(nextStartTimeRef.current, outputCtx.currentTime);
+                            
+                            const audioBuffer = await decodeAudioData(
+                                decode(base64Audio),
+                                outputCtx,
+                                24000,
+                                1
+                            );
+
+                            const source = outputCtx.createBufferSource();
+                            source.buffer = audioBuffer;
+                            source.connect(outputCtx.destination);
+                            
+                            source.addEventListener('ended', () => {
+                                sourcesRef.current.delete(source);
+                            });
+
+                            source.start(nextStartTimeRef.current);
+                            nextStartTimeRef.current += audioBuffer.duration;
+                            sourcesRef.current.add(source);
+                        }
+
+                        if (msg.serverContent?.interrupted) {
+                            sourcesRef.current.forEach(source => source.stop());
+                            sourcesRef.current.clear();
+                            nextStartTimeRef.current = 0;
+                        }
+                    },
+                    onclose: () => {
+                        console.log("Session Closed");
+                        setIsConnected(false);
+                    },
+                    onerror: (err) => {
+                        console.error("Session Error", err);
+                        setError("Connection lost. Please reconnect.");
+                        disconnect();
+                    }
+                }
+            });
+
+            sessionPromiseRef.current = sessionPromise;
+
+        } catch (e: any) {
+            console.error("Connection failed", e);
+            setError("Failed to connect to AI service. Check permissions and internet.");
+            setIsConnected(false);
         }
     };
 
-    const handleUserMessage = async (text: string) => {
-        if (!text.trim()) return;
-
-        const userMsg: ChatMessage = {
-            id: Date.now().toString(),
-            role: 'user',
-            text: text,
-            timestamp: new Date()
-        };
+    const startVideoLoop = (sessionPromise: Promise<any>) => {
+        if (!videoRef.current) return;
         
-        // Use ref to get latest history
-        const updatedMessages = [...messagesRef.current, userMsg];
-        setMessages(updatedMessages);
+        // Ensure video is playing
+        navigator.mediaDevices.getUserMedia({ video: true }).then(stream => {
+            if (videoRef.current) {
+                videoRef.current.srcObject = stream;
+            }
+        });
 
-        // Get AI Response using Ref for nativeLanguage
-        const response = await interactWithEnglishTutor(updatedMessages, text, nativeLanguageRef.current);
-        
-        const aiMsg: ChatMessage = {
-            id: (Date.now() + 1).toString(),
-            role: 'model',
-            text: response,
-            timestamp: new Date()
-        };
+        const ctx = canvasRef.current.getContext('2d');
+        const videoEl = videoRef.current;
 
-        setMessages(prev => [...prev, aiMsg]);
-        speak(response);
+        videoIntervalRef.current = window.setInterval(() => {
+            if (videoEl.readyState === 4 && ctx) {
+                canvasRef.current.width = videoEl.videoWidth / 2; // Downscale for bandwidth
+                canvasRef.current.height = videoEl.videoHeight / 2;
+                ctx.drawImage(videoEl, 0, 0, canvasRef.current.width, canvasRef.current.height);
+                
+                canvasRef.current.toBlob(async (blob) => {
+                    if (blob) {
+                        const base64Data = await blobToBase64(blob);
+                        sessionPromise.then(session => {
+                            session.sendRealtimeInput({
+                                media: { data: base64Data, mimeType: 'image/jpeg' }
+                            });
+                        });
+                    }
+                }, 'image/jpeg', 0.6);
+            }
+        }, 1000); // Send frame every 1 second
     };
 
-    const handleTextSubmit = (e: React.FormEvent) => {
-        e.preventDefault();
-        if (!inputText.trim()) return;
+    const disconnect = () => {
+        // Stop Audio
+        if (processorRef.current) {
+            processorRef.current.disconnect();
+            processorRef.current = null;
+        }
+        if (inputSourceRef.current) {
+            inputSourceRef.current.disconnect();
+            inputSourceRef.current = null;
+        }
+        if (audioContextRef.current) {
+            audioContextRef.current.close();
+            audioContextRef.current = null;
+        }
         
-        setTranscript(inputText);
-        handleUserMessage(inputText);
-        setInputText('');
+        // Stop Video
+        if (videoIntervalRef.current) {
+            clearInterval(videoIntervalRef.current);
+            videoIntervalRef.current = null;
+        }
+        if (videoRef.current && videoRef.current.srcObject) {
+            (videoRef.current.srcObject as MediaStream).getTracks().forEach(t => t.stop());
+            videoRef.current.srcObject = null;
+        }
+
+        setIsConnected(false);
+        sourcesRef.current.forEach(s => s.stop());
+        sourcesRef.current.clear();
+    };
+
+    const toggleCamera = () => {
+        setCameraEnabled(!cameraEnabled);
+        if (cameraEnabled) {
+            // Turning off
+            if (videoIntervalRef.current) clearInterval(videoIntervalRef.current);
+            if (videoRef.current && videoRef.current.srcObject) {
+                (videoRef.current.srcObject as MediaStream).getTracks().forEach(t => t.stop());
+                videoRef.current.srcObject = null;
+            }
+        } else {
+            // Turning on (if already connected)
+            if (isConnected && sessionPromiseRef.current) {
+               startVideoLoop(sessionPromiseRef.current);
+            }
+        }
     };
 
     return (
         <Layout>
             <div className="h-[calc(100vh-8rem)] flex flex-col">
+                {/* Header */}
                 <div className="mb-4 flex items-center justify-between">
-                    <Link to="/job-prep/communication" className="text-gray-500 hover:text-gray-900 flex items-center gap-2 text-sm font-medium">
-                        <ArrowLeft size={16} /> End Session
+                    <Link to="/job-prep" className="text-gray-500 hover:text-gray-900 flex items-center gap-2 text-sm font-medium">
+                        <ArrowLeft size={16} /> Exit Session
                     </Link>
                     <div className="flex items-center gap-4">
-                         <button 
-                            onClick={() => setCameraEnabled(!cameraEnabled)}
-                            className={`p-2 rounded-full ${cameraEnabled ? 'bg-gray-100 text-gray-700' : 'bg-red-50 text-red-500'}`}
-                            title={cameraEnabled ? "Turn Camera Off" : "Turn Camera On"}
-                         >
-                            {cameraEnabled ? <Video size={18} /> : <VideoOff size={18} />}
-                         </button>
                         <div className="flex items-center gap-2 bg-white px-3 py-1.5 rounded-full border border-gray-200 shadow-sm">
                             <Globe size={14} className="text-brand-600" />
                             <select 
                                 value={nativeLanguage}
                                 onChange={(e) => setNativeLanguage(e.target.value)}
-                                className="text-sm border-none bg-transparent font-medium text-gray-700 focus:outline-none cursor-pointer"
+                                disabled={isConnected}
+                                className="text-sm border-none bg-transparent font-medium text-gray-700 focus:outline-none cursor-pointer disabled:opacity-50"
                             >
-                                <option value="Spanish">Native: Spanish</option>
-                                <option value="Hindi">Native: Hindi</option>
-                                <option value="French">Native: French</option>
-                                <option value="German">Native: German</option>
-                                <option value="Chinese">Native: Chinese</option>
-                                <option value="Arabic">Native: Arabic</option>
+                                <option value="Spanish">Spanish</option>
+                                <option value="Hindi">Hindi</option>
+                                <option value="French">French</option>
+                                <option value="German">German</option>
+                                <option value="Chinese">Chinese</option>
                             </select>
                         </div>
                     </div>
                 </div>
 
-                <div className="flex-1 bg-gradient-to-br from-indigo-50 to-blue-50 rounded-3xl shadow-xl border border-white/50 overflow-hidden relative flex flex-col backdrop-blur-sm">
+                {/* Main Content */}
+                <div className="flex-1 bg-gradient-to-br from-indigo-900 to-slate-900 rounded-3xl shadow-xl border border-white/10 overflow-hidden relative flex flex-col items-center justify-center p-6 text-white">
                     
-                    {/* Main Avatar Area */}
-                    <div className="flex-1 flex flex-col items-center justify-center relative p-6">
-                        
-                        {/* Avatar Visuals */}
-                        <div className="relative mb-8">
-                            {/* Outer Glows */}
-                            <div className={`absolute -inset-4 bg-blue-500/20 rounded-full blur-xl transition-all duration-500 ${isSpeaking ? 'scale-150 opacity-100' : 'scale-100 opacity-50'}`}></div>
-                            <div className={`absolute -inset-8 bg-purple-500/20 rounded-full blur-2xl transition-all duration-700 ${isSpeaking ? 'scale-125 opacity-80' : 'scale-90 opacity-30'}`}></div>
-
-                            {/* Avatar Image */}
-                            <div className="relative w-40 h-40 md:w-56 md:h-56 rounded-full border-4 border-white shadow-2xl overflow-hidden bg-white z-10">
-                                <img 
-                                    src={`https://api.dicebear.com/7.x/avataaars/svg?seed=Felix&mouth=${isSpeaking ? 'smile' : 'default'}&eyebrows=default`} 
-                                    alt="AI Tutor" 
-                                    className={`w-full h-full object-cover transition-transform duration-300 ${isSpeaking ? 'scale-105' : 'scale-100'}`} 
-                                />
-                            </div>
-
-                            {/* Speaking Indicator Badge */}
-                            <div className={`absolute bottom-2 right-2 z-20 bg-white rounded-full p-2 shadow-lg transition-all duration-300 ${isSpeaking ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-2'}`}>
-                                <div className="flex gap-1">
-                                    <span className="w-1 h-3 bg-brand-500 rounded-full animate-[bounce_1s_infinite]"></span>
-                                    <span className="w-1 h-3 bg-brand-500 rounded-full animate-[bounce_1s_infinite_0.2s]"></span>
-                                    <span className="w-1 h-3 bg-brand-500 rounded-full animate-[bounce_1s_infinite_0.4s]"></span>
-                                </div>
-                            </div>
-                        </div>
-
-                        {/* Status Message */}
-                        <div className="text-center h-12">
-                            {isListening ? (
-                                <p className="text-xl font-bold text-gray-800 animate-pulse flex items-center justify-center gap-2">
-                                    <span className="w-2 h-2 bg-red-500 rounded-full"></span>
-                                    Listening...
-                                </p>
-                            ) : isSpeaking ? (
-                                <p className="text-xl font-bold text-blue-600">AI is speaking...</p>
-                            ) : isKeyboardMode ? (
-                                <p className="text-gray-500 font-medium">Type your message below</p>
-                            ) : (
-                                <p className="text-gray-500 font-medium">Tap the mic to start speaking</p>
-                            )}
-                            
-                            {/* Dismissible Error Toast */}
-                            {error && (
-                                <div className="mt-2 inline-flex items-center gap-2 bg-red-50 border border-red-100 px-4 py-2 rounded-full animate-fade-in-up">
-                                    <p className="text-red-600 text-sm font-medium">{error}</p>
-                                    <button 
-                                        onClick={() => setError('')} 
-                                        className="text-red-400 hover:text-red-600"
-                                    >
-                                        <X size={14} />
-                                    </button>
-                                </div>
-                            )}
-                        </div>
-
-                        {/* Last User Message (Subtitles) */}
-                        {transcript && !isKeyboardMode && (
-                            <div className="mt-4 px-6 py-3 bg-white/80 backdrop-blur rounded-2xl border border-white/50 shadow-sm max-w-lg text-center">
-                                <p className="text-gray-700 font-medium">"{transcript}"</p>
-                            </div>
-                        )}
-                    </div>
-
-                    {/* Student Camera Feed (Picture-in-Picture) */}
-                    <div className="absolute top-6 right-6 w-32 md:w-48 aspect-[3/4] bg-gray-900 rounded-2xl overflow-hidden shadow-2xl border-2 border-white/20 z-30 transition-all hover:scale-105">
-                         {cameraEnabled ? (
-                            <video 
-                                ref={videoRef} 
-                                autoPlay 
-                                playsInline 
-                                muted 
-                                className="w-full h-full object-cover transform -scale-x-100" 
-                            />
-                         ) : (
-                            <div className="w-full h-full flex items-center justify-center bg-gray-800">
-                                <VideoOff className="text-gray-500" />
-                            </div>
-                         )}
-                         <div className="absolute bottom-2 left-2 bg-black/50 text-white text-[10px] px-2 py-0.5 rounded-md font-bold backdrop-blur-md">
-                            YOU
-                         </div>
-                    </div>
-
-                    {/* Chat History Overlay (Bottom Left) */}
-                    <div className="absolute bottom-28 left-6 w-80 max-h-64 overflow-y-auto space-y-3 pr-2 hidden md:block scrollbar-hide">
-                         {[...messages].reverse().slice(0, 3).map((msg) => (
-                             <div key={msg.id} className={`p-3 rounded-xl text-sm shadow-sm backdrop-blur-md border border-white/50 ${
-                                 msg.role === 'user' ? 'bg-white/90 text-gray-800 ml-auto' : 'bg-blue-600/90 text-white'
-                             }`}>
-                                 {msg.text}
+                    {/* Connection Status / Start Screen */}
+                    {!isConnected && (
+                        <div className="text-center space-y-8 z-20 max-w-md">
+                             <div className="w-24 h-24 bg-brand-600 rounded-full flex items-center justify-center mx-auto shadow-[0_0_40px_rgba(34,197,94,0.3)] animate-pulse">
+                                <Mic size={40} className="text-white" />
                              </div>
-                         ))}
-                    </div>
+                             <div>
+                                 <h2 className="text-3xl font-bold mb-2">Ready to Speak?</h2>
+                                 <p className="text-indigo-200">Connect to Gemini Live for a real-time conversation practice. I can hear and see you.</p>
+                             </div>
+                             
+                             {error && (
+                                <div className="bg-red-500/20 border border-red-500/50 p-4 rounded-xl text-red-200 text-sm">
+                                    {error}
+                                </div>
+                             )}
 
-                    {/* Controls Bar */}
-                    <div className="h-24 bg-white border-t border-gray-100 flex items-center justify-center gap-6 relative z-40 shadow-[0_-4px_20px_rgba(0,0,0,0.05)] px-6">
-                         {/* Left: Stop Speaking */}
-                         <button 
-                            onClick={() => synth.cancel()} 
-                            className="p-3 md:p-4 rounded-full text-gray-400 hover:bg-red-50 hover:text-red-500 transition-colors"
-                            title="Stop Speaking"
-                        >
-                            <StopCircle size={24} />
-                         </button>
-
-                         {/* Center: Interaction Mode */}
-                         {isKeyboardMode ? (
-                            <form onSubmit={handleTextSubmit} className="flex-1 max-w-lg flex gap-2">
-                                <input
-                                    type="text"
-                                    value={inputText}
-                                    onChange={(e) => setInputText(e.target.value)}
-                                    placeholder="Type your response..."
-                                    className="flex-1 bg-gray-100 border-none rounded-xl px-4 focus:ring-2 focus:ring-brand-500 focus:outline-none"
-                                    autoFocus
-                                />
-                                <button 
-                                    type="submit"
-                                    disabled={!inputText.trim()}
-                                    className="bg-brand-600 text-white p-3 rounded-xl hover:bg-brand-700 disabled:opacity-50 transition-colors"
-                                >
-                                    <Send size={20} />
-                                </button>
-                            </form>
-                         ) : (
                              <button 
-                                onClick={toggleListening}
-                                className={`w-16 h-16 rounded-full flex items-center justify-center shadow-lg transition-all transform active:scale-95 border-4 border-white ${
-                                    isListening 
-                                    ? 'bg-red-500 text-white shadow-red-200 scale-110 ring-4 ring-red-100' 
-                                    : 'bg-brand-600 text-white shadow-brand-200 hover:bg-brand-700'
-                                }`}
+                                onClick={connect}
+                                className="w-full py-4 bg-white text-brand-900 rounded-xl font-bold text-lg hover:bg-gray-100 transition-all shadow-lg active:scale-95 flex items-center justify-center gap-2"
                             >
-                                {isListening ? <MicOff size={28} /> : <Mic size={28} />}
+                                <Power size={20} />
+                                Start Live Session
                             </button>
-                         )}
+                        </div>
+                    )}
 
-                         {/* Right: Toggle Mode & Replay */}
-                         <div className="flex gap-2">
-                            <button 
-                                onClick={() => {
-                                    const lastAiMsg = [...messages].reverse().find(m => m.role === 'model');
-                                    if (lastAiMsg) speak(lastAiMsg.text);
-                                }}
-                                className="p-3 md:p-4 rounded-full text-gray-400 hover:bg-blue-50 hover:text-blue-500 transition-colors"
-                                title="Replay Last Message"
-                            >
-                                <RefreshCw size={24} />
-                            </button>
+                    {/* Active Session View */}
+                    {isConnected && (
+                        <div className="w-full h-full flex flex-col relative z-20">
                             
-                            <button 
-                                onClick={() => {
-                                    setIsKeyboardMode(!isKeyboardMode);
-                                    if(isListening) toggleListening(); // Stop mic if switching
-                                    setError('');
-                                }}
-                                className={`p-3 md:p-4 rounded-full transition-colors ${isKeyboardMode ? 'bg-brand-50 text-brand-600' : 'text-gray-400 hover:bg-gray-100'}`}
-                                title={isKeyboardMode ? "Switch to Voice Mode" : "Switch to Keyboard Mode"}
-                            >
-                                {isKeyboardMode ? <Mic size={24} /> : <Keyboard size={24} />}
-                            </button>
-                         </div>
-                    </div>
+                            {/* Gemini Avatar / Visualizer */}
+                            <div className="flex-1 flex flex-col items-center justify-center">
+                                <div className="relative">
+                                    <div className="absolute -inset-4 bg-indigo-500/30 rounded-full blur-xl animate-pulse"></div>
+                                    <img 
+                                        src={`https://api.dicebear.com/7.x/avataaars/svg?seed=Kore&backgroundColor=b6e3f4`} 
+                                        alt="AI Tutor" 
+                                        className="w-48 h-48 rounded-full border-4 border-white/20 shadow-2xl relative z-10"
+                                    />
+                                    <div className="absolute bottom-0 right-0 bg-green-500 border-4 border-slate-900 w-8 h-8 rounded-full z-20 flex items-center justify-center">
+                                        <Activity size={16} className="text-white" />
+                                    </div>
+                                </div>
+                                <div className="mt-8 text-center">
+                                    <h3 className="text-2xl font-bold text-white">AI Tutor (Live)</h3>
+                                    <p className="text-indigo-300 text-sm animate-pulse">Listening & Watching...</p>
+                                </div>
+                            </div>
+
+                            {/* User Self View (PIP) */}
+                            <div className="absolute top-0 right-0 w-32 md:w-48 aspect-[3/4] bg-black/50 rounded-2xl overflow-hidden border border-white/20 shadow-2xl">
+                                {cameraEnabled ? (
+                                    <video 
+                                        ref={videoRef} 
+                                        autoPlay 
+                                        playsInline 
+                                        muted 
+                                        className="w-full h-full object-cover transform -scale-x-100" 
+                                    />
+                                ) : (
+                                    <div className="w-full h-full flex items-center justify-center text-gray-500">
+                                        <VideoOff />
+                                    </div>
+                                )}
+                                
+                                {/* Audio Level Visualizer overlay */}
+                                <div className="absolute bottom-2 left-2 flex gap-0.5 items-end h-4">
+                                    {[1,2,3,4].map(i => (
+                                        <div 
+                                            key={i} 
+                                            className="w-1 bg-green-500 rounded-full transition-all duration-75"
+                                            style={{ height: `${Math.min(100, audioLevel * (i/2))}%` }}
+                                        ></div>
+                                    ))}
+                                </div>
+                            </div>
+
+                            {/* Controls */}
+                            <div className="mt-auto pt-6 flex justify-center gap-4">
+                                <button 
+                                    onClick={toggleCamera}
+                                    className={`p-4 rounded-full transition-all ${cameraEnabled ? 'bg-white/10 text-white hover:bg-white/20' : 'bg-red-500/20 text-red-400 border border-red-500/50'}`}
+                                >
+                                    {cameraEnabled ? <Video size={24} /> : <VideoOff size={24} />}
+                                </button>
+                                <button 
+                                    onClick={disconnect}
+                                    className="px-8 py-4 bg-red-600 hover:bg-red-700 text-white rounded-full font-bold shadow-lg shadow-red-900/20 transition-all flex items-center gap-2"
+                                >
+                                    <Power size={20} />
+                                    End Session
+                                </button>
+                            </div>
+                        </div>
+                    )}
                 </div>
             </div>
         </Layout>
